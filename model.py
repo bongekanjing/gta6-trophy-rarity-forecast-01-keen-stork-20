@@ -170,16 +170,74 @@ def player_curve(history, horizon_hours):
     mid = _saturating_at(plateau, tau, t0, n0, t_end)
 
     # The plateau is the least safe number in the fit: a window that ends before
-    # the curve has visibly bent cannot tell a long tau from a large A. Carry the
-    # best-fit tau and a longer one, and take the spread between them.
-    alt = _saturating_at(plateau, tau * 2.5, t0, n0, t_end)
-    lo, hi = sorted((mid, alt))
-    mid = max(mid, n_last)
-    lo = max(lo, n_last)
+    # the curve has visibly bent cannot tell a long tau from a large A. So the
+    # answer is not read off the best fit alone. A saturating curve fitted to a
+    # window that is still climbing will bend too early and land low, and an
+    # under-predicted denominator is the expensive direction here: it makes the
+    # forecast rate too high, and the rate has to fall by the full rise in n.
+    # Carry the best fit, a longer taper, and the straight line the window's own
+    # average slope implies, then take the median of the three as the middle.
+    alt = _saturating_at(plateau, tau * 3.0, t0, n0, t_end)
+    moving = [(t, n) for t, n in pairs if n > n0 * 1.05] or pairs
+    lin = _linear_near(moving, n_last, horizon_hours)
+    cands = sorted([mid, alt, lin])
+    mid = max(cands[1], n_last)
+    lo = max(cands[0], n_last)
+    hi = max(cands[2], n_last)
+    # The spread is the disagreement between the three readings, widened a
+    # little: across the tapers this data cannot rule out, the predicted count
+    # ranges over a factor of two, and the band has to straddle that or the
+    # forecast pays for every trophy on the wrong side of it.
     spread = math.log(max(hi, 1.0) / max(lo, 1.0)) if lo > 0 else 0.0
-    spread = min(1.2, max(0.15, spread))
+    spread = min(1.4, max(0.55, 1.25 * spread))
     growth = mid / n_last if n_last > 0 else 1.0
     return mid, growth, spread
+
+
+def _linear_near(pairs, n_last, horizon_hours):
+    """A straight-line read of the last day's climb, kept near the data.
+
+    Over a 60-hour window the count is still rising at roughly its recent pace,
+    so this is the optimistic end of the range. The slope is taken from the last
+    day of reads only, since a launch ramp slows down and the whole window's
+    average overstates what happens next; and the result is capped at a decade of
+    growth so one flat or noisy stretch cannot produce a number the rest of the
+    forecast has to carry.
+    """
+    if len(pairs) < 3 or horizon_hours <= 0:
+        return n_last
+    day = [(t, n) for t, n in pairs if t >= pairs[-1][0] - 24.0]
+    if len(day) < 2:
+        day = pairs[-3:]
+    (ta, na), (tb, nb) = day[0], day[-1]
+    span = tb - ta
+    if span <= 0 or na <= 0 or nb <= 0:
+        return n_last
+    rate = math.log(nb / na) / span
+    if rate <= 0:
+        return n_last
+    return min(n_last * math.exp(rate * horizon_hours), n_last * 12.0)
+
+
+def _avg_ln_slope(pairs):
+    """The growth rate of the reads that have started moving, per hour.
+
+    The window usually opens with a flat stretch while Exophase has not yet
+    refreshed (the rules record 638 tracked for the whole of launch night), so
+    taking the slope from the first read would divide a real climb by a stretch
+    of no climb and badly understate it. Starting from the first read that has
+    left the opening floor is the only slope this data supports.
+    """
+    if len(pairs) < 3:
+        return 0.0
+    floor = pairs[0][1] * 1.05
+    moved = [(t, n) for t, n in pairs if n > floor]
+    if len(moved) < 2:
+        return 0.0
+    (t0, n0), (t1, n1) = moved[0], moved[-1]
+    if t1 <= t0 or n0 <= 0 or n1 <= 0:
+        return 0.0
+    return math.log(n1 / n0) / (t1 - t0)
 
 
 def _saturating_at(plateau, tau, t0, n0, t):
@@ -190,47 +248,49 @@ def _saturating_at(plateau, tau, t0, n0, t):
 
 
 def _fit_saturating(pairs, t0, n0):
-    """Fit a saturating curve anchored on the last read.
+    """Fit a saturating curve, keeping the taper inside a plausible range.
 
-    The curve is n(t) = A - (A - n_last) * exp(-(t - t_last)/tau), so it passes
-    through the last reading exactly and only its plateau A and taper tau are
-    free. Anchoring matters here: the recorded history is not one smooth curve.
-    It sits flat while Exophase has not refreshed (638 tracked for the whole of
-    launch night) and then steps 6x between two adjacent reads, and a curve that
-    is not pinned to the last read will spend its freedom on that step instead of
-    on where the count is going.
+    The curve is n(t) = A - (A - n_start) * exp(-(t - t_start)/tau) for the
+    reads from the point the count first leaves its floor, and it is fitted in
+    log space with A and tau both free, so the window's own curvature chooses
+    the taper rather than the fit being pinned through its last point.
 
-    Only reads after the count has started moving are fitted, because a flat
-    pre-refresh plateau carries no information about the taper; and the fit is in
-    log space, so a miss low down costs what a miss high up costs.
+    The taper is held to at least 36 hours. That floor is not arbitrary: the real
+    page climbed from 3,868 to 14,028 tracked between the first refresh and the
+    read 23 hours later, and it was still climbing at that point, so a launch ramp
+    that has finished inside a day and a half is contradicted by the only long
+    observation there is. Without the floor a 60-hour window fits a fast taper
+    that explains the reads just as well and then extrapolates to a plateau the
+    count has nowhere near reached.
     """
-    span = pairs[-1][0] - t0
-    if span <= 0:
+    if len(pairs) < 3:
         return None
+    floor = pairs[0][1] * 1.05
+    moved = [(t, n) for t, n in pairs if n > floor]
+    if len(moved) < 3:
+        moved = pairs
+    t_start, n_start = moved[0]
     t_last, n_last = pairs[-1]
-    moving = [(t, n) for t, n in pairs if n > pairs[0][1] * 1.05]
-    if len(moving) < 3:
-        moving = pairs
-    base = math.log(max(n_last, 1.0))
+    span = max(t_last - t_start, 1e-9)
+    base = math.log(max(n_start, 1.0))
     best = None
-    for step in range(1, 241):
-        tau = span * (0.10 * (1.0 + step / 4.0))
+    for step in range(1, 201):
+        tau = 36.0 + span * (1.60 * step / 200.0)
         xs, ys = [], []
-        for t, n in moving:
-            if t >= t_last:
-                continue
-            x = 1.0 - math.exp(-(t - t_last) / tau)   # negative: t is earlier
+        for t, n in moved:
+            x = 1.0 - math.exp(-(t - t_start) / tau)
             xs.append(x)
             ys.append(math.log(max(n, 1.0)) - base)
         den = sum(x * x for x in xs)
         if den <= 1e-12:
             continue
-        slope = sum(x * y for x, y in zip(xs, ys)) / den
-        if slope <= 0:
+        top = sum(x * y for x, y in zip(xs, ys)) / den
+        if top <= 0:
             continue
-        # ln(A) - ln(n_last) = slope, and A must clear the last reading.
-        a = math.exp(base + slope)
-        sse = sum((base + slope * x - (y + base)) ** 2 for x, y in zip(xs, ys))
+        a = math.exp(base + top)
+        if a < n_last * 0.999:
+            continue                     # a plateau below the last read
+        sse = sum((base + top * x - (y + base)) ** 2 for x, y in zip(xs, ys))
         if best is None or sse < best[2]:
             best = (a, tau, sse)
     return best
