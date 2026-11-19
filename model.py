@@ -180,18 +180,23 @@ def player_curve(history, horizon_hours):
     alt = _saturating_at(plateau, tau * 3.0, t0, n0, t_end)
     moving = [(t, n) for t, n in pairs if n > n0 * 1.05] or pairs
     lin = _linear_near(moving, n_last, horizon_hours)
-    cands = sorted([mid, alt, lin])
-    mid = max(cands[1], n_last)
-    lo = max(cands[0], n_last)
-    hi = max(cands[2], n_last)
-    # The spread is the disagreement between the three readings, widened a
-    # little: across the tapers this data cannot rule out, the predicted count
-    # ranges over a factor of two, and the band has to straddle that or the
-    # forecast pays for every trophy on the wrong side of it.
-    spread = math.log(max(hi, 1.0) / max(lo, 1.0)) if lo > 0 else 0.0
+    # Where the count lands is the middle of three readings, taken in log space:
+    # the best fit, a three-times-longer taper, and the last day's slope. The
+    # plain median of the three sits low whenever two of them saturate, because
+    # then the optimistic reading is outvoted by two that agree only because they
+    # both gave up early. On the world the two real reads imply, and on a launch
+    # that never bends at all, the geometric middle is the one that keeps the band
+    # over the truth; the arithmetic mean buys the same coverage with more loss.
+    cands = sorted([max(mid, n_last), max(alt, n_last), max(lin, n_last)])
+    centre = math.exp(sum(math.log(c) for c in cands) / 3.0)
+    # The spread is the disagreement between the three, widened a little: across
+    # the tapers this data cannot rule out, the predicted count ranges over a
+    # factor of two, and the band has to straddle that or the forecast pays for
+    # every trophy on the wrong side of it.
+    spread = math.log(max(cands[2], 1.0) / max(cands[0], 1.0))
     spread = min(1.4, max(0.55, 1.25 * spread))
-    growth = mid / n_last if n_last > 0 else 1.0
-    return mid, growth, spread
+    growth = centre / n_last if n_last > 0 else 1.0
+    return centre, growth, spread
 
 
 def _linear_near(pairs, n_last, horizon_hours):
